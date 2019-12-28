@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+require("./start.js");
+return;
 
 // DEBUG
 //process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
@@ -10,14 +12,15 @@ var url = require('url');
 var request = require("request");
 var exec = require('child_process').exec;
 var debug = process.execArgv.find(function (e) { return e.startsWith('--debug'); }) !== undefined;
-
+var MAXIMEITRYCOUNT = 3;
+var currentImieTryCount = 0;
 // Load settings 
 var SettingsHelper = require("./lib/SettingsHelper.js");
 var settingsHelper = new SettingsHelper();
 
 var packagePath = settingsHelper.nodePackagePath;
 
-process.env.NODE_PATH = packagePath;
+process.env.NODE_PATH = process.env.NODE_PATH ? process.env.NODE_PATH + ":" + packagePath : packagePath;
 process.env.HOME = os.userInfo().homedir;
 
 require('app-module-path').addPath(packagePath);
@@ -35,7 +38,7 @@ function SnapLoginHandler(settingsHelper) {
     var count = 0;
     this.start = function (isFirstStart) {
         this.interval = setInterval(function () {
-            if (isFirstStart) {
+            if (isFirstStart && (currentImieTryCount < MAXIMEITRYCOUNT)) {
                 tryGetIMEI(function (imei) {
                     if (imei) {
                         clearInterval(self.interval);
@@ -45,32 +48,76 @@ function SnapLoginHandler(settingsHelper) {
                                     clearInterval(self.interval);
                                     console.log("done");
                                 }
-                            })
-                        }, 2000);
+                            });
+                        }, 30000);
                     }
-                })
+                    else {
+                        currentImieTryCount++;
+                    }
+                });
+            }
+            else if (isFirstStart && (currentImieTryCount >= MAXIMEITRYCOUNT)) {
+                clearInterval(self.interval);
+                console.log();
+                console.log("Was not able to get the IMEI id :(");
+                console.log("Let's try logging in using whitelist instead...");
+                console.log();
+
+                process.argv.push("-w");
+                require("./start.js");
+                return;
             }
             else {
                 pingBeforeStart(function (online) {
                     if (online) {
                         clearInterval(self.interval);
                         console.log("STARTSNAP: Online");
-                        require("./start.js");
+                        try{
+                            require("./start.js");
+                            return;
+                        }
+                        catch(ex){
+                            console.log("Failed to call start.js. " + ex);
+                            setTimeout(() => {
+                                try{
+                                    console.log("Retrying to require start.js");
+                                    require("./start.js");
+                                    return;
+                                }
+                                catch(ex){
+                                    console.log("Failed again :(" + ex);
+                                    return;
+                                }   
+                            }, 1000);
+                        }
                     }
                 })
             }
         }, 10000);
-    }
-    function pingBeforeStart (callback) {
+    };
+    function pingBeforeStart(callback) {
         var hubUri = url.parse(settingsHelper.settings.hubUri);
 
         var uri = 'https://' + hubUri.host;
         console.log("STARTSNAP: pinging..." + uri);
         request.post({ url: uri, timeout: 5000 }, function (err, response, body) {
             if (err) {
-                console.error("STARTSNAP: ERROR: error: " + err);
-                callback();
-                return;
+                // Offline mode...
+                if ((err.code === "ECONNREFUSED" ||
+                    err.code === "EACCES" ||
+                    err.code === "ENOTFOUND") &&
+                    settingsHelper.settings.policies &&
+                    settingsHelper.settings.policies.disconnectPolicy.offlineMode) {
+
+                    console.log('Starting snap in offline mode');
+                    require("./start.js");
+                    callback(true);
+                }
+                else {
+                    console.error("STARTSNAP: ERROR: error: " + err);
+                    callback();
+                    return;
+                }
             }
             else if (response.statusCode !== 200) {
                 console.error("STARTSNAP: FAILED: response: " + response.statusCode);
@@ -86,7 +133,7 @@ function SnapLoginHandler(settingsHelper) {
     }
 
     function tryGetIMEI(callback) {
-        
+
         exec("mmcli -m 0|grep -oE \"imei: '(.*)'\"|sed 's/imei: //g'|sed \"s/'//g\"", function (error, stdout, stderr) {
             console.log('STARTSNAP: imei: ' + stdout);
             if (error) {
@@ -102,9 +149,8 @@ function SnapLoginHandler(settingsHelper) {
         });
     }
     function tryLoginUsingICCID(imei, callback) {
-        var hubUri = url.parse(settingsHelper.settings.hubUri);
-
-        var uri = 'https://' + hubUri.host + '/jasper/signInUsingICCID?iccid=' + imei;
+        let host = process.env.MSB_HOST ? process.env.MSB_HOST: url.parse(settingsHelper.settings.hubUri).host;
+        let uri = `https://${host}/jasper/signInUsingIMEI?imeiId=${imei}&hostname=${os.hostname()}`;
         console.log("STARTSNAP: calling jasper service..." + uri);
         request.post({ url: uri, timeout: 5000 }, function (err, response, body) {
             if (err) {
@@ -112,13 +158,13 @@ function SnapLoginHandler(settingsHelper) {
                 callback();
                 return;
             }
-            else if(response.statusCode === 302){
+            else if (response.statusCode === 302) {
                 settingsHelper.settings.hubUri = "wss://" + url.parse(response.headers.location).host;
                 console.log('REDIRECTED TO: ' + settingsHelper.settings.hubUri);
                 settingsHelper.save();
                 callback();
                 return;
-                
+
             }
             else if (response.statusCode !== 200) {
                 console.error("STARTSNAP: FAILED: response: " + response.statusCode);
@@ -140,5 +186,12 @@ function SnapLoginHandler(settingsHelper) {
             }
         })
     }
-   
+
 }
+
+
+
+
+
+
+
